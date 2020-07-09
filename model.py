@@ -1,360 +1,745 @@
-"""GANomaly
-"""
-# pylint: disable=C0301,E1101,W0622,C0103,R0902,R0915
-
-##
-from collections import OrderedDict
+from __future__ import division
 import os
+import sys
 import time
+import math
+import tensorflow as tf
 import numpy as np
-from tqdm import tqdm
+from six.moves import xrange
+import dataset_loaders.cifar_loader as cifar_data
+import dataset_loaders.mnist_loader as mnist_data
 
-from torch.autograd import Variable
-import torch.optim as optim
-import torch.nn as nn
-import torch.utils.data
-import torchvision.utils as vutils
+import scipy
+from ops import *
+from utils import *
 
-from lib.networks import NetG, NetD, weights_init
-from lib.visualizer import Visualizer
-from lib.loss import l2_loss
-from lib.evaluate import evaluate
+import real_nvp.model as nvp
+import real_nvp.nn as nvp_op
 
-##
-class Ganomaly(object):
-    """GANomaly Class
+#import inception_score
+
+class DCGAN(object):
+  def __init__(self, sess, input_height=32, input_width=32,
+         batch_size=64, sample_num = 64, z_dim=100, gf_dim=64, df_dim=64,
+         gfc_dim=1024, dfc_dim=1024, c_dim=3, dataset_name='default', checkpoint_dir=None,
+         f_div='cross-ent', prior="logistic", min_lr=0.0, lr_decay=1.0,
+         model_type="nice", alpha=1e-7, log_dir=None,
+         init_type="uniform",reg=0.5, n_critic=1.0, hidden_layers=1000,
+         no_of_layers= 8, like_reg=0.1, just_sample=False, batch_norm_adaptive=1):
     """
 
-    @staticmethod
-    def name():
-        """Return name of the class.
-        """
-        return 'Ganomaly'
+    Args:
+      sess: TensorFlow session
+      batch_size: The size of batch. Should be specified before training.
+      y_dim: (optional) Dimension of dim for y. [None]
+      z_dim: (optional) Dimension of dim for Z. [100]
+      gf_dim: (optional) Dimension of gen filters in first conv layer. [64]
+      df_dim: (optional) Dimension of discrim filters in first conv layer. [64]
+      gfc_dim: (optional) Dimension of gen units for for fully connected layer. [1024]
+      dfc_dim: (optional) Dimension of discrim units for fully connected layer. [1024]
+      c_dim: (optional) Dimension of image color. For grayscale input, set to 1. [3]
+    """
+    self.sess = sess
+    self.is_grayscale = (c_dim == 1)
 
-    def __init__(self, opt, dataloader=None):
-        super(Ganomaly, self).__init__()
-        ##
-        # Initalize variables.
-        self.opt = opt
-        self.visualizer = Visualizer(opt)
-        self.dataloader = dataloader
-        self.trn_dir = os.path.join(self.opt.outf, self.opt.name, 'train')
-        self.tst_dir = os.path.join(self.opt.outf, self.opt.name, 'test')
-        self.device = torch.device("cuda:0" if self.opt.device != 'cpu' else "cpu")
+    self.batch_size = batch_size
+    self.sample_num = batch_size
+    
+    self.input_height = input_height
+    self.input_width = input_width
+    self.prior = prior
 
-        # -- Discriminator attributes.
-        self.out_d_real = None
-        self.feat_real = None
-        self.err_d_real = None
-        self.fake = None
-        self.latent_i = None
-        self.latent_o = None
-        self.out_d_fake = None
-        self.feat_fake = None
-        self.err_d_fake = None
-        self.err_d = None
+    self.z_dim = z_dim
 
-        # -- Generator attributes.
-        self.out_g = None
-        self.err_g_bce = None
-        self.err_g_l1l = None
-        self.err_g_enc = None
-        self.err_g = None
+    self.gf_dim = gf_dim
+    self.df_dim = df_dim
 
-        # -- Misc attributes
-        self.epoch = 0
-        self.times = []
-        self.total_steps = 0
+    self.gfc_dim = gfc_dim
+    self.dfc_dim = dfc_dim
 
-        ##
-        # Create and initialize networks.
-        self.netg = NetG(self.opt).to(self.device)
-        self.netd = NetD(self.opt).to(self.device)
-        self.netg.apply(weights_init)
-        self.netd.apply(weights_init)
+    self.c_dim = c_dim
 
-        ##
-        if self.opt.resume != '':
-            print("\nLoading pre-trained networks.")
-            self.opt.iter = torch.load(os.path.join(self.opt.resume, 'netG.pth'))['epoch']
-            self.netg.load_state_dict(torch.load(os.path.join(self.opt.resume, 'netG.pth'))['state_dict'])
-            self.netd.load_state_dict(torch.load(os.path.join(self.opt.resume, 'netD.pth'))['state_dict'])
-            print("\tDone.\n")
+    self.lr_decay = lr_decay
+    self.min_lr = min_lr
+    self.model_type = model_type
+    self.log_dir = log_dir
+    self.alpha = alpha
+    self.init_type = init_type
+    self.reg = reg
+    self.n_critic = n_critic
+    self.hidden_layers = hidden_layers
+    self.no_of_layers = no_of_layers
+    
+    # batch normalization : deals with poor initialization helps gradient flow
+    self.d_bn1 = batch_norm(name='d_bn1')
+    self.d_bn2 = batch_norm(name='d_bn2')
+    self.dataset_name = dataset_name
+    self.like_reg = like_reg
+    if self.dataset_name != 'mnist':
+      self.d_bn3 = batch_norm(name='d_bn3')
 
-        # print(self.netg)
-        # print(self.netd)
+    self.checkpoint_dir = checkpoint_dir
+    self.f_div = f_div
+    
+    seed = 0
+    np.random.seed(seed)
+    tf.set_random_seed(seed)
+    
+    self.build_model()
 
-        ##
-        # Loss Functions
-        self.bce_criterion = nn.BCELoss()
-        self.l1l_criterion = nn.L1Loss()
-        self.l2l_criterion = l2_loss
+  def build_model(self):
+    seed =0
+    np.random.seed(seed)
+    tf.set_random_seed(seed)
 
-        ##
-        # Initialize input tensors.
-        self.input = torch.empty(size=(self.opt.batchsize, 3, self.opt.isize, self.opt.isize), dtype=torch.float32, device=self.device)
-        self.label = torch.empty(size=(self.opt.batchsize,), dtype=torch.float32, device=self.device)
-        self.gt    = torch.empty(size=(opt.batchsize,), dtype=torch.long, device=self.device)
-        self.fixed_input = torch.empty(size=(self.opt.batchsize, 3, self.opt.isize, self.opt.isize), dtype=torch.float32, device=self.device)
-        self.real_label = 1
-        self.fake_label = 0
+    image_dims = [self.input_height, self.input_width, self.c_dim]
 
-        ##
-        # Setup optimizer
-        if self.opt.isTrain:
-            self.netg.train()
-            self.netd.train()
-            self.optimizer_d = optim.Adam(self.netd.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, 0.999))
-            self.optimizer_g = optim.Adam(self.netg.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, 0.999))
+    self.inputs = tf.placeholder(
+      tf.float32, [self.batch_size] + image_dims, name='real_images')
+    self.sample_inputs = tf.placeholder(
+      tf.float32, [self.sample_num] + image_dims, name='sample_inputs')
+    self.image_size = np.prod(image_dims)
+    self.image_dims = image_dims
+    if self.dataset_name == "cifar":
+      inputs = tf.map_fn(lambda img: tf.image.random_flip_left_right(img), self.inputs)
+    else:
+      inputs = self.inputs
 
-    ##
-    def set_input(self, input):
-        """ Set input and ground truth
+    sample_inputs = self.sample_inputs
 
-        Args:
-            input (FloatTensor): Input data for batch i.
-        """
-        self.input.data.resize_(input[0].size()).copy_(input[0])
-        self.gt.data.resize_(input[1].size()).copy_(input[1])
+    self.z = tf.placeholder(
+      tf.float32, [self.batch_size, self.z_dim], name='z')
+    self.z_sum = histogram_summary("z", self.z)
 
-        # Copy the first batch as the fixed input.
-        if self.total_steps == self.opt.batchsize:
-            self.fixed_input.data.resize_(input[0].size()).copy_(input[0])
+    #### f: Image Space to Latent space #########
+    #self.flow_model = tf.make_template('model',
+    #  lambda x: nvp.model_spec(x, reuse=False, model_type=self.model_type, train=False,
+    #    alpha=self.alpha, init_type=self.init_type, hidden_layers=self.hidden_layers,
+    #    no_of_layers=self.no_of_layers, batch_norm_adaptive=1), unique_name_='model')
 
-    ##
-    def update_netd(self):
-        """
-        Update D network: Ladv = |f(real) - f(fake)|_2
-        """
-        ##
-        # Feature Matching.
-        self.netd.zero_grad()
-        # --
-        # Train with real
-        self.label.data.resize_(self.opt.batchsize).fill_(self.real_label)
-        self.out_d_real, self.feat_real = self.netd(self.input)
-        # --
-        # Train with fake
-        self.label.data.resize_(self.opt.batchsize).fill_(self.fake_label)
-        self.fake, self.latent_i, self.latent_o = self.netg(self.input)
-        self.out_d_fake, self.feat_fake = self.netd(self.fake.detach())
-        # --
-        self.err_d = l2_loss(self.feat_real, self.feat_fake)
-        self.err_d_real = self.err_d
-        self.err_d_fake = self.err_d
-        self.err_d.backward()
-        self.optimizer_d.step()
+    #self.flow_model = tf.make_template('model',
+    #                                   lambda x: nvp.model_spec(x, reuse=False, model_type=self.model_type, train=False,
+    #                                                            alpha=self.alpha, init_type=self.init_type,
+    #                                                            hidden_layers=self.hidden_layers,
+    #                                                            no_of_layers=self.no_of_layers, batch_norm_adaptive=1),
+    #                                   unique_name_='model')
+
+    #self.flow_model = tf.make_template('model', lambda x: nvp.model_spec(x, reuse=True, model_type=self.model_type, train=False,
+    #                                                            alpha=self.alpha, init_type=self.init_type,
+    #                                                            hidden_layers=self.hidden_layers,
+    #                                                            no_of_layers=self.no_of_layers, batch_norm_adaptive=1),
+    #                                                            unique_name_='model')
+
+    self.flow_model = tf.make_template('model',
+     lambda x: nvp.model_spec(x, reuse=False, model_type=self.model_type, train=False,
+       alpha=self.alpha, init_type=self.init_type, hidden_layers=self.hidden_layers,
+       no_of_layers=self.no_of_layers, batch_norm_adaptive=1), unique_name_='model')
+
+    #### f: Image Space to Latent space for training #########
+    self.trainable_flow_model = tf.make_template('model', 
+      lambda x: nvp.model_spec(x, reuse=True, model_type=self.model_type, train=True, 
+        alpha=self.alpha, init_type=self.init_type, hidden_layers=self.hidden_layers,
+        no_of_layers=self.no_of_layers, batch_norm_adaptive=1), unique_name_='model')
+
+    # ##### f^-1: Latent to image (trainable)#######
+    self.flow_inv_model = tf.make_template('model', 
+      lambda x: nvp.inv_model_spec(x, reuse=True, model_type=self.model_type,
+       train=True,alpha=self.alpha), unique_name_='model')
+    # ##### f^-1: Latent to image (not-trainable just for sampling)#######
+    self.sampler_function = tf.make_template('model', 
+      lambda x: nvp.inv_model_spec(x, reuse=True, model_type=self.model_type, 
+        alpha=self.alpha,train=False), unique_name_='model')
+
+    
+    self.generator_train_batch = self.flow_inv_model
+    
+    ############### SET SIZE FOR TEST BATCH DEPENDING ON WHETHER WE USE Linear or Conv arch##########
+    if self.model_type == "nice":
+      self.log_like_batch = tf.placeholder(\
+        tf.float32, [self.batch_size, self.image_size], name='log_like_batch')
+    elif self.model_type == "real_nvp":
+      self.log_like_batch = tf.placeholder(\
+        tf.float32, [self.batch_size] + self.image_dims, name='log_like_batch')
+    ###############################################
+
+    gen_para, jac = self.flow_model(self.log_like_batch)
+    if self.dataset_name == "mnist":
+      self.log_likelihood = nvp_op.log_likelihood(gen_para, jac, self.prior)/(self.batch_size)
+    else:
+      # to calculate values in bits per dim we need to
+      # multiply the density by the width of the 
+      # discrete probability area, which is 1/256.0, per dimension.
+      # The calculation is performed in the log space.
+      self.log_likelihood = nvp_op.log_likelihood(gen_para, jac, self.prior)/(self.batch_size)
+      self.log_likelihood = 8. + self.log_likelihood / (np.log(2)*self.image_size)
+
+    self.G_before_postprocessing = self.generator_train_batch(self.z)
+    self.sampler_before_postprocessing = self.sampler_function(self.z)
+
+    if self.model_type == "real_nvp":
+      ##For data dependent init (not completely implemented)
+      self.x_init = tf.placeholder(tf.float32, shape=[self.batch_size] + image_dims)
+      # run once for data dependent initialization of parameters
+      self.trainable_flow_model(self.x_init)
+    
+    inputs_tr_flow = inputs
+    if self.model_type == "nice":
+      split_val = int(self.image_size /2)
+      self.permutation = np.arange(self.image_size)
+      tmp = self.permutation.copy()
+      self.permutation[:split_val] = tmp[::2]
+      self.permutation[split_val:] = tmp[1::2]
+      self.for_perm = np.identity(self.image_size)
+      self.for_perm = tf.constant(self.for_perm[:,self.permutation], tf.float32)
+      self.rev_perm = np.identity(self.image_size)
+      self.rev_perm = tf.constant(self.rev_perm[:,np.argsort(self.permutation)], tf.float32)
+      self.G_before_postprocessing \
+      = tf.matmul(self.G_before_postprocessing,self.rev_perm)
+      self.sampler_before_postprocessing \
+      = tf.clip_by_value(tf.matmul(self.sampler_before_postprocessing, self.rev_perm) , 0., 1.)
+      inputs_tr_flow = tf.matmul(tf.reshape(inputs, [self.batch_size, self.image_size]), self.for_perm)
+
+    train_gen_para, train_jac = self.trainable_flow_model(inputs_tr_flow)
+    self.train_log_likelihood = nvp_op.log_likelihood(train_gen_para, train_jac, self.prior) / self.batch_size
+    
+    self.sampler = tf.reshape(self.sampler_before_postprocessing, [self.batch_size] + image_dims)
+    self.G = tf.reshape(self.G_before_postprocessing, [self.batch_size] + image_dims)
+
+    inputs = inputs*255.0
+    corruption_level = 1.0
+    inputs = inputs + corruption_level * tf.random_uniform([self.batch_size] + image_dims)
+    inputs = inputs/(255.0 + corruption_level)
+
+    self.D, self.D_logits = self.discriminator(inputs, reuse=False)
+
+    self.D_, self.D_logits_ = self.discriminator(self.G, reuse=True)
+
+    self.d_sum = histogram_summary("d", self.D)
+    self.d__sum = histogram_summary("d_", self.D_)
+    self.G_sum = image_summary("G", self.G)
+
+    def sigmoid_cross_entropy_with_logits(x, y):
+      try:
+        return tf.nn.sigmoid_cross_entropy_with_logits(logits=x, labels=y)
+      except:
+        return tf.nn.sigmoid_cross_entropy_with_logits(logits=x, targets=y)
+
+    ### Vanilla gan loss
+    if self.f_div == 'ce':
+      self.d_loss_real = tf.reduce_mean(
+        sigmoid_cross_entropy_with_logits(self.D_logits, tf.ones_like(self.D)))
+      self.d_loss_fake = tf.reduce_mean(
+        sigmoid_cross_entropy_with_logits(self.D_logits_, tf.zeros_like(self.D_)))
+      self.g_loss = tf.reduce_mean(
+        sigmoid_cross_entropy_with_logits(self.D_logits_, tf.ones_like(self.D_)))
+    else:
+    ### other gan losses
+      if self.f_div == 'hellinger':
+        self.d_loss_real = tf.reduce_mean(tf.exp(-self.D_logits))
+        self.d_loss_fake = tf.reduce_mean(tf.exp(self.D_logits_) - 2.)
+        self.g_loss = tf.reduce_mean(tf.exp(-self.D_logits_))
+      elif self.f_div == 'rkl':
+        self.d_loss_real = tf.reduce_mean(tf.exp(self.D_logits))
+        self.d_loss_fake = tf.reduce_mean(-self.D_logits_ - 1.)
+        self.g_loss = -tf.reduce_mean(-self.D_logits_ - 1.)
+      elif self.f_div == 'kl':
+        self.d_loss_real = tf.reduce_mean(-self.D_logits)
+        self.d_loss_fake = tf.reduce_mean(tf.exp(self.D_logits_ - 1.))
+        self.g_loss = tf.reduce_mean(-self.D_logits_)
+      elif self.f_div == 'tv':
+        self.d_loss_real = tf.reduce_mean(-0.5 * tf.tanh(self.D_logits))
+        self.d_loss_fake = tf.reduce_mean(0.5 * tf.tanh(self.D_logits_))
+        self.g_loss = tf.reduce_mean(-0.5 * tf.tanh(self.D_logits_))
+      elif self.f_div == 'lsgan':
+        self.d_loss_real = 0.5 * tf.reduce_mean((self.D_logits-1)**2)
+        self.d_loss_fake = 0.5 * tf.reduce_mean(self.D_logits_**2)
+        self.g_loss = 0.5 * tf.reduce_mean((self.D_logits_-1)**2)
+      elif self.f_div == "wgan":
+        self.g_loss = -tf.reduce_mean(self.D_logits_)
+        self.d_loss_real = -tf.reduce_mean(self.D_logits)
+        self.d_loss_fake = tf.reduce_mean(self.D_logits_)
+        alpha = tf.random_uniform(
+            shape=[1, self.batch_size], 
+            minval=0.,
+            maxval=1.
+        )
+        fake_data = self.G
+        real_data = inputs
+        differences = fake_data - real_data
+        interpolates = real_data + \
+        tf.transpose(alpha*tf.transpose(differences, perm=[1,2,3,0]), [3,0,1,2])
+        _, d_inter = self.discriminator(interpolates, reuse=True) 
+        gradients = tf.gradients(d_inter, [interpolates])[0]
+        slopes = tf.sqrt(tf.reduce_sum(tf.square(gradients), reduction_indices=[1]))
+        self.gradient_penalty = tf.reduce_mean((slopes-1.)**2)
+      else:
+        print("ERROR: Unrecognized f-divergence...exiting")
+        exit(-1)
+
+    self.d_loss_real_sum = scalar_summary("d_loss_real", self.d_loss_real)
+    self.d_loss_fake_sum = scalar_summary("d_loss_fake", self.d_loss_fake)
+                          
+    if self.f_div == "wgan":
+      self.d_loss = self.d_loss_real + self.d_loss_fake + self.reg * self.gradient_penalty
+    else:
+      self.d_loss = self.d_loss_real + self.d_loss_fake
+
+    self.g_loss_sum = scalar_summary("g_loss", self.g_loss)
+    self.d_loss_sum = scalar_summary("d_loss", self.d_loss)
+
+    t_vars = tf.trainable_variables()
+
+    self.d_vars = [var for var in t_vars if '/d_' in var.name]
+    self.g_vars = [var for var in t_vars if '/g_' in var.name]
+    print("gen_vars:")
+    for var in self.g_vars:
+      print(var.name)
+
+    print("disc_vars:")
+    for var in self.d_vars:
+      print(var.name)
+    
+    self.saver = tf.train.Saver(max_to_keep=0)
+
+  def evaluate_neg_loglikelihood(self, data, config):
+    log_like_batch_idxs = len(data) // config.batch_size
+    lli_list = []
+    for idx in xrange(0, log_like_batch_idxs):
+      batch_images = data[idx*config.batch_size:(idx+1)*config.batch_size]
+      batch_images = np.cast[np.float32](batch_images)
+      
+      if self.model_type == "nice":
+        batch_images = batch_images[:,self.permutation]
+
+      lli = self.sess.run([self.log_likelihood],
+        feed_dict={self.log_like_batch: batch_images})
+      
+      lli_list.append(lli)
+
+    return np.mean(lli_list)
+
+  def evaluate_neg_loglikelihood2(self, data, config):
+    log_like_batch_idxs = len(data) // config.batch_size
+    lli_list = []
+    for idx in xrange(0, log_like_batch_idxs):
+      batch_images = data[idx * config.batch_size:(idx + 1) * config.batch_size]
+      batch_images = np.cast[np.float32](batch_images)
+
+      if self.model_type == "nice":
+        batch_images = batch_images[:, self.permutation]
+
+      lli = self.sess.run([self.log_likelihood],
+                          feed_dict={self.log_like_batch: batch_images})
+
+      lli_list.append(lli)
+
+    return np.exp(-np.mean(lli_list) / 1000000)
+
+  def evaluate_neg_loglikelihood22(self, data, config):
+      log_like_batch_idxs = data.shape[0] // config.batch_size
+      lli_list = []
+      for idx in xrange(0, log_like_batch_idxs):
+          batch_images = data[idx * config.batch_size:(idx + 1) * config.batch_size]
+          batch_images = batch_images.cpu().detach().numpy()
+          batch_images = np.cast[np.float32](batch_images)
+
+          if self.model_type == "nice":
+              batch_images = batch_images[:, self.permutation]
+
+          lli = self.sess.run([self.log_likelihood],
+                              feed_dict={self.log_like_batch: batch_images})
+
+          lli_list.append(lli)
+
+      return np.mean(lli_list)
+
+  def train(self, config):
+    seed = 0
+    np.random.seed(seed)
+    tf.set_random_seed(seed)
+    """Train DCGAN"""
+    if config.dataset == "mnist":
+      data_X, val_data, test_data, train_dist = mnist_data.load_mnist()
+    elif config.dataset == "cifar":
+      data_X, val_data, test_data = cifar_data.load_cifar()
+
+    if self.model_type == "nice":
+      val_data = np.reshape(val_data, (-1,self.image_size))
+      test_data = np.reshape(test_data, (-1, self.image_size))
+
+    lr = config.learning_rate
+    self.learning_rate = tf.placeholder(tf.float32, [], name='lr')
+
+    d_optim_ = tf.train.AdamOptimizer(self.learning_rate, beta1=config.beta1, beta2=0.9)
+    d_grad = d_optim_.compute_gradients(self.d_loss, var_list=self.d_vars)
+    d_grad_mag = tf.global_norm(d_grad)
+    d_optim = d_optim_.apply_gradients(d_grad)          
+
+    g_optim_ = tf.train.AdamOptimizer(self.learning_rate, beta1=config.beta1, beta2=0.9)
+    if self.n_critic <= 0:
+      g_grad = g_optim_.compute_gradients(self.train_log_likelihood\
+          , var_list=self.g_vars)
+    else:
+      if self.like_reg > 0:
+        if self.model_type == "real_nvp":
+          g_grad_1 = g_optim_.compute_gradients(self.g_loss / self.like_reg, var_list=self.g_vars)
+          g_grad_2 = g_optim_.compute_gradients(self.train_log_likelihood, var_list=self.g_vars)
+          grads_1, _ = zip(*g_grad_1)
+          grads_2, _ = zip(*g_grad_2)
+          sum_grad = [g1+g2 for g1, g2 in zip(grads_1, grads_2)]
+          g_grad = [pair for pair in zip(sum_grad, [var for grad, var in g_grad_1])]
+        else:
+          g_grad = g_optim_.compute_gradients(self.g_loss/self.like_reg + self.train_log_likelihood ,var_list=self.g_vars)  
+      else:
+        g_grad = g_optim_.compute_gradients(self.g_loss, var_list=self.g_vars)
+
+    
+    g_grad_mag = tf.global_norm(g_grad)
+    g_optim = g_optim_.apply_gradients(g_grad)         
+
+    try: ##for data-dependent init (not implemented)
+      if self.model_type == "real_nvp":
+        self.sess.run(tf.global_variables_initializer(),
+          {self.x_init: data_X[0:config.batch_size]})
+      else:
+        self.sess.run(tf.global_variables_initializer())
+    except:
+      if self.model_type == "real_nvp":
+        self.sess.run(tf.global_variables_initializer(),
+          {self.x_init: data_X[0:config.batch_size]})
+      else:
+        self.sess.run(tf.global_variables_initializer())
+
+    self.g_sum = merge_summary([self.z_sum, self.d__sum,
+      self.G_sum, self.d_loss_fake_sum, self.g_loss_sum])
+    self.d_sum = merge_summary(
+        [self.z_sum, self.d_sum, self.d_loss_real_sum, self.d_loss_sum])
+    self.writer = SummaryWriter("./"+self.log_dir, self.sess.graph)
+
+    counter = 1
+    start_time = time.time()
+    could_load, checkpoint_counter = self.load(self.checkpoint_dir)
+    if could_load:
+      counter = checkpoint_counter
+      print(" [*] Load SUCCESS")
+    else:
+      print(" [!] Load failed...")
+
+    ############## A FIXED BATCH OF Zs FOR GENERATING SAMPLES ######################
+    if self.prior == "uniform":
+      sample_z = np.random.uniform(-1, 1, size=(self.sample_num , self.z_dim))
+    elif self.prior == "logistic":
+      sample_z = np.random.logistic(loc=0., scale=1., size=(self.sample_num , self.z_dim))
+    elif self.prior == "gaussian":
+      sample_z = np.random.normal(0.0, 1.0, size=(self.sample_num , self.z_dim))
+    else:
+        print("ERROR: Unrecognized prior...exiting")
+        exit(-1)
+
+    ################################ Evaluate initial model lli ########################
+
+    val_nlli = self.evaluate_neg_loglikelihood(val_data, config)
+    # train_nlli = self.evaluate_neg_loglikelihood(train_data, config)
+
+    curr_inception_score = self.calculate_inception_and_mode_score()
+    print("INITIAL TEST: val neg logli: %.8f,incep score: %.8f" % (val_nlli,\
+     curr_inception_score[0]))
+    if counter > 1:
+      old_data = np.load("./"+config.sample_dir+'/graph_data.npy') 
+      self.best_val_nlli = old_data[2]
+      self.best_model_counter = old_data[3]
+      self.best_model_path = old_data[4]
+      self.val_nlli_list = old_data[1]
+      self.counter_list = old_data[5]
+      self.batch_train_nlli_list = old_data[-4]
+      self.inception_list = old_data[-2]
+      self.samples_list = old_data[0]
+      self.loss_list = old_data[-1]
+      manifold_h, manifold_w = old_data[6]
+    else:
+      self.writer.add_summary(tf.Summary(\
+              value=[tf.Summary.Value(tag="Val Neg Log-likelihood", simple_value=val_nlli)]), counter)
+      # self.writer.add_summary(tf.Summary(\
+      #         value=[tf.Summary.Value(tag="Train Neg Log-likelihood", simple_value=train_nlli)]), counter)
+
+      self.best_val_nlli = val_nlli
+      # self.best_model_train_nlli = train_nlli
+      self.best_model_counter = counter
+      self.best_model_path = self.save(config.checkpoint_dir, counter)
+      # self.train_nlli_list = [train_nlli]
+      self.val_nlli_list = [val_nlli]
+      self.counter_list = [1]
+      self.batch_train_nlli_list = []
+      self.inception_list = [curr_inception_score]
+      self.samples_list = self.sess.run([self.sampler],
+              feed_dict={
+                  self.z: sample_z,
+              }
+            )
+      sample_inputs = data_X[0:config.batch_size]
+      samples = self.samples_list[0]
+      manifold_h = int(np.ceil(np.sqrt(samples.shape[0])))
+      manifold_w = int(np.floor(np.sqrt(samples.shape[0])))
+      self.loss_list = self.sess.run(
+              [self.d_loss_real, self.d_loss_fake],
+              feed_dict={
+                  self.z: sample_z,
+                  self.inputs: sample_inputs,
+              })
+    ##################################################################################
+
+    for epoch in xrange(config.epoch):
+      np.random.shuffle(data_X)
+      batch_idxs = len(data_X) // config.batch_size
+      
+      for idx in xrange(0, batch_idxs):
+        sys.stdout.flush()
+        batch_images = data_X[idx*config.batch_size:(idx+1)*config.batch_size]
+        
+        if self.prior == "uniform":
+          batch_z = np.random.uniform(-1, 1, [config.batch_size, self.z_dim]) \
+              .astype(np.float32)
+        elif self.prior == "logistic":
+          batch_z = np.random.logistic(loc=0.,scale=1.0,size=[config.batch_size, self.z_dim]) \
+              .astype(np.float32)
+        elif self.prior == "gaussian":
+          batch_z = np.random.normal(0.0, 1.0, size=(config.batch_size , self.z_dim))
+        else:
+          print("ERROR: Unrecognized prior...exiting")
+          exit(-1)
+
+        for r in range(self.n_critic):
+          _, d_g_mag, errD_fake, errD_real ,summary_str = self.sess.run([d_optim, d_grad_mag, 
+            self.d_loss_fake, self.d_loss_real, self.d_sum],
+            feed_dict={ 
+              self.inputs: batch_images,
+              self.z: batch_z,
+              self.learning_rate:lr,
+            })
+        if self.n_critic > 0:
+          self.writer.add_summary(summary_str, counter)
+
+        # Update G network
+        if self.like_reg > 0 or self.n_critic <= 0:
+          _, g_g_mag, errG, summary_str = self.sess.run([g_optim, g_grad_mag, self.g_loss, self.g_sum],
+            feed_dict={
+              self.z: batch_z, 
+              self.learning_rate:lr,
+              self.inputs: batch_images,
+            })
+        else:
+          _, g_g_mag ,errG, summary_str = self.sess.run([g_optim, g_grad_mag, self.g_loss, self.g_sum],
+            feed_dict={
+              self.z: batch_z, 
+              self.learning_rate:lr,
+            })
+        self.writer.add_summary(summary_str, counter)
+
+        batch_images_nl = batch_images
+        if self.model_type == "nice":
+          batch_images_nl = np.reshape(batch_images_nl,(self.batch_size, -1))[:,self.permutation]
+        b_train_nlli = self.sess.run([self.log_likelihood], feed_dict={
+          self.log_like_batch: batch_images_nl,
+          })
+        b_train_nlli = b_train_nlli[0]
+
+        self.batch_train_nlli_list.append(b_train_nlli)
+        if self.n_critic > 0:
+          self.loss_list.append([errD_real, errD_fake])
+          self.writer.add_summary(tf.Summary(\
+          value=[tf.Summary.Value(tag="training loss", simple_value=-(errD_fake+errD_real))]) ,counter)
+        self.writer.add_summary(tf.Summary(\
+          value=[tf.Summary.Value(tag="Batch train Neg Log-likelihood", simple_value=b_train_nlli)]) ,counter)
+        counter += 1
 
 
-    ##
-    def reinitialize_netd(self):
-        """ Initialize the weights of netD
-        """
-        self.netd.apply(weights_init)
-        print('Reloading d net')
+        lr = max(lr * self.lr_decay, self.min_lr)
 
-    ##
-    def update_netg(self):
-        """
-        # ============================================================ #
-        # (2) Update G network: log(D(G(x)))  + ||G(x) - x||           #
-        # ============================================================ #
+        if np.mod(counter, 703) == 1: #340
+          if self.n_critic > 0:
+            print("Epoch: [%2d] [%4d/%4d] time: %4.4f, d_loss: %.8f, g_loss: %.8f, d_grad_mag: %.8f, g_grad_mag: %.8f, lr: %.8f" \
+          % (epoch, idx, batch_idxs,
+            time.time() - start_time, errD_fake+errD_real, errG, d_g_mag, g_g_mag, lr))
+          else:
+            print("Epoch: [%2d] [%4d/%4d] time: %4.4f, g_loss: %.8f, g_grad_mag: %.8f, lr: %.8f" \
+          % (epoch, idx, batch_idxs,
+            time.time() - start_time, errG, g_g_mag, lr))
+          curr_model_path = self.save(config.checkpoint_dir, counter)
 
-        """
-        self.netg.zero_grad()
-        self.label.data.resize_(self.opt.batchsize).fill_(self.real_label)
-        self.out_g, _ = self.netd(self.fake)
+          val_nlli=self.evaluate_neg_loglikelihood(val_data, config)
 
-        self.err_g_bce = self.bce_criterion(self.out_g, self.label)
-        self.err_g_l1l = self.l1l_criterion(self.fake, self.input)  # constrain x' to look like x
-        self.err_g_enc = self.l2l_criterion(self.latent_o, self.latent_i)
-        self.err_g = self.err_g_bce * self.opt.w_bce + self.err_g_l1l * self.opt.w_rec + self.err_g_enc * self.opt.w_enc
+          # train_nlli = self.evaluate_neg_loglikelihood(train_data, config)
+          curr_inception_score = self.calculate_inception_and_mode_score()
 
-        self.err_g.backward(retain_graph=True)
-        self.optimizer_g.step()
+          print("[LogLi (%d,%d)]: val neg logli: %.8f, ince: %.8f, train lli: %.8f" % (epoch, idx,val_nlli,\
+           curr_inception_score[0], np.mean(self.batch_train_nlli_list[-700:])))
 
-    ##
-    def optimize(self):
-        """ Optimize netD and netG  networks.
-        """
+          self.writer.add_summary(tf.Summary(\
+                  value=[tf.Summary.Value(tag="Val Neg Log-likelihood", simple_value=val_nlli)]), counter)
+          # self.writer.add_summary(tf.Summary(\
+          #         value=[tf.Summary.Value(tag="Train Neg Log-likelihood", simple_value=train_nlli)]), counter)
+          if val_nlli < self.best_val_nlli:
+            self.best_val_nlli = val_nlli
+            self.best_model_counter = counter
+            self.best_model_path = curr_model_path
+            # self.best_model_train_nlli = train_nlli
+          # self.train_nlli_list.append(train_nlli)
+          self.val_nlli_list.append(val_nlli)
+          self.counter_list.append(counter)
 
-        self.update_netd()
-        self.update_netg()
+          samples, d_loss, g_loss = self.sess.run(
+            [self.sampler, self.d_loss, self.g_loss],
+            feed_dict={
+                self.z: sample_z,
+                self.inputs: sample_inputs,
+            }
+          )
+          self.samples_list.append(samples)
+          self.samples_list[-1].shape[1]
+          manifold_h = int(np.ceil(np.sqrt(samples.shape[0])))
+          manifold_w = int(np.floor(np.sqrt(samples.shape[0])))
+          self.inception_list.append(curr_inception_score)
+          save_images(samples, [manifold_h, manifold_w],
+                './{}/train_{:02d}_{:04d}.png'.format(config.sample_dir, epoch, idx))
+          print("[Sample] d_loss: %.8f, g_loss: %.8f" % (d_loss, g_loss))
 
-        # If D loss is zero, then re-initialize netD
-        if self.err_d_real.item() < 1e-5 or self.err_d_fake.item() < 1e-5:
-            self.reinitialize_netd()
+          np.save("./"+config.sample_dir+'/graph_data', 
+            [self.samples_list, self.val_nlli_list, self.best_val_nlli, self.best_model_counter,\
+             self.best_model_path, self.counter_list, [manifold_h, manifold_w], \
+             self.batch_train_nlli_list, self.inception_list, self.loss_list])
 
-    ##
-    def get_errors(self):
-        """ Get netD and netG errors.
+    
+    np.save("./"+config.sample_dir+'/graph_data', 
+            [self.samples_list, self.val_nlli_list, self.best_val_nlli, self.best_model_counter,\
+             self.best_model_path, self.counter_list, [manifold_h, manifold_w], \
+             self.batch_train_nlli_list, self.inception_list, self.loss_list])
+    self.test_model(test_data, config)
 
-        Returns:
-            [OrderedDict]: Dictionary containing errors.
-        """
+  def test_model(self, test_data, config):
+    print("[*] Restoring best model counter: %d, val neg lli: %.8f" 
+      % (self.best_model_counter, self.best_val_nlli))
+    self.saver.restore(self.sess, self.best_model_path)
+    print("[*] Best model restore from: " + self.best_model_path)
+    print("[*] Evaluating on the test set")
+    test_nlli = self.evaluate_neg_loglikelihood(test_data, config)
+    print("[*] Test negative log likelihood: %.8f" % (test_nlli))
 
-        errors = OrderedDict([('err_d', self.err_d.item()),
-                              ('err_g', self.err_g.item()),
-                              ('err_d_real', self.err_d_real.item()),
-                              ('err_d_fake', self.err_d_fake.item()),
-                              ('err_g_bce', self.err_g_bce.item()),
-                              ('err_g_l1l', self.err_g_l1l.item()),
-                              ('err_g_enc', self.err_g_enc.item())])
+  def calculate_inception_and_mode_score(self):
+    #to get mode scores add code to load your favourite mnist classifier in inception_score.py
+    if self.dataset_name == "mnist": 
+      return [0.0, 0.0, 0.0, 0.0]
+    sess = self.sess
+    all_samples = []
+    for i in range(18):
+        if self.prior == "uniform":
+          batch_z = np.random.uniform(-1, 1, [self.batch_size, self.z_dim]) \
+              .astype(np.float32)
+        elif self.prior == "logistic":
+          batch_z = np.random.logistic(loc=0.,scale=1.0,size=[self.batch_size, self.z_dim]) \
+              .astype(np.float32)
+        elif self.prior == "gaussian":
+          batch_z = np.random.normal(0.0, 1.0, size=(self.batch_size , self.z_dim))
+        else:
+          print("ERROR: Unrecognized prior...exiting")
+          exit(-1)
+        samples_curr = self.sess.run(
+            [self.sampler],
+            feed_dict={
+                self.z: batch_z,}
+          )
+        all_samples.append(samples_curr[0])
+    all_samples = np.concatenate(all_samples, axis=0)
+    # return all_samples
+    all_samples = (all_samples*255.).astype('int32')
+    
+    return inception_score.get_inception_and_mode_score(list(all_samples), sess=sess)
+  
+  def discriminator(self, image, y=None, reuse=False):
+    with tf.variable_scope("discriminator") as scope:
+      tf.set_random_seed(0)
+      np.random.seed(0)
+      if reuse:
+        scope.reuse_variables()
 
-        return errors
+      if self.dataset_name != "mnist":
+        if self.f_div == "wgan":
+          hn1 = image
+         
+          h0 = Layernorm('d_ln_1', [1,2,3], lrelu(conv2d(hn1, self.df_dim , name='d_h0_conv')))
+          h1 = Layernorm('d_ln_2', [1,2,3], lrelu(conv2d(h0, self.df_dim*2, name='d_h1_conv')))
+          h2 = Layernorm('d_ln_3', [1,2,3], lrelu(conv2d(h1, self.df_dim*4, name='d_h2_conv')))
+          h3 = Layernorm('d_ln_4', [1,2,3], lrelu(conv2d(h2, self.df_dim*8, name='d_h3_conv')))
+          h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h3_lin')
+      
+          return tf.nn.sigmoid(h4), h4
+        else:
+          h0 = lrelu(conv2d(image, self.df_dim, name='d_h0_conv'))
+          h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim*2, name='d_h1_conv')))
+          h2 = lrelu(self.d_bn2(conv2d(h1, self.df_dim*4, name='d_h2_conv')))
+          h3 = lrelu(self.d_bn3(conv2d(h2, self.df_dim*8, name='d_h3_conv')))
+          h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h3_lin')
 
-    ##
-    def get_current_images(self):
-        """ Returns current images.
+          return tf.nn.sigmoid(h4), h4
+      else:
+        if self.f_div == "wgan":
+          x = image
 
-        Returns:
-            [reals, fakes, fixed]
-        """
+          h0 = lrelu(conv2d(x, self.c_dim, name='d_h0_conv'))
 
-        reals = self.input.data
-        fakes = self.fake.data
-        fixed = self.netg(self.fixed_input)[0].data
+          h1 = lrelu(conv2d(h0, self.df_dim , name='d_h1_conv'))
+          h1 = tf.reshape(h1, [self.batch_size, -1])      
 
-        return reals, fakes, fixed
+          h2 = lrelu(linear(h1, self.dfc_dim, 'd_h2_lin'))
 
-    ##
-    def save_weights(self, epoch):
-        """Save netG and netD weights for the current epoch.
+          h3 = linear(h2, 1, 'd_h3_lin')
 
-        Args:
-            epoch ([int]): Current epoch number.
-        """
+          return tf.nn.sigmoid(h3), h3
+        else:
+          x = image
+          
+          h0 = lrelu(conv2d(x, self.c_dim, name='d_h0_conv'))
+          
+          h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim , name='d_h1_conv')))
+          h1 = tf.reshape(h1, [self.batch_size, -1])      
+          
+          h2 = lrelu(self.d_bn2(linear(h1, self.dfc_dim, 'd_h2_lin')))
+          
+          h3 = linear(h2, 1, 'd_h3_lin')
+            
+          return tf.nn.sigmoid(h3), h3
 
-        weight_dir = os.path.join(self.opt.outf, self.opt.name, 'train', 'weights')
-        if not os.path.exists(weight_dir):
-            os.makedirs(weight_dir)
 
-        torch.save({'epoch': epoch + 1, 'state_dict': self.netg.state_dict()},
-                   '%s/netG.pth' % (weight_dir))
-        torch.save({'epoch': epoch + 1, 'state_dict': self.netd.state_dict()},
-                   '%s/netD.pth' % (weight_dir))
+  @property
+  def model_dir(self):
+    return "{}_{}_{}_{}".format(
+        self.dataset_name, self.batch_size,
+        self.input_height, self.input_width)
+      
+  def save(self, checkpoint_dir, step):
+    model_name = "DCGAN.model"
+    checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
 
-    ##
-    def train_epoch(self):
-        """ Train the model for one epoch.
-        """
+    if not os.path.exists(checkpoint_dir):
+      os.makedirs(checkpoint_dir)
 
-        self.netg.train()
-        epoch_iter = 0
-        for data in tqdm(self.dataloader['train'], leave=False, total=len(self.dataloader['train'])):
-            self.total_steps += self.opt.batchsize
-            epoch_iter += self.opt.batchsize
+    return self.saver.save(self.sess,
+            os.path.join(checkpoint_dir, model_name),
+            global_step=step)
 
-            self.set_input(data)
-            self.optimize()
+  def load(self, checkpoint_dir):
+    import re
+    print(" [*] Reading checkpoints...")
+    checkpoint_dir = os.path.join(checkpoint_dir, self.model_dir)
 
-            if self.total_steps % self.opt.print_freq == 0:
-                errors = self.get_errors()
-                if self.opt.display:
-                    counter_ratio = float(epoch_iter) / len(self.dataloader['train'].dataset)
-                    self.visualizer.plot_current_errors(self.epoch, counter_ratio, errors)
+    ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
+    if ckpt and ckpt.model_checkpoint_path:
+      ckpt_name = os.path.basename(ckpt.model_checkpoint_path)
+      self.saver.restore(self.sess, os.path.join(checkpoint_dir, ckpt_name))
+      counter = int(next(re.finditer("(\d+)(?!.*\d)",ckpt_name)).group(0))
+      print(" [*] Success to read {}".format(ckpt_name))
+      return True, counter
+    else:
+      print(" [*] Failed to find a checkpoint")
+      return False, 0
 
-            if self.total_steps % self.opt.save_image_freq == 0:
-                reals, fakes, fixed = self.get_current_images()
-                self.visualizer.save_current_images(self.epoch, reals, fakes, fixed)
-                if self.opt.display:
-                    self.visualizer.display_current_images(reals, fakes, fixed)
 
-        print(">> Training model %s. Epoch %d/%d" % (self.name(), self.epoch+1, self.opt.niter))
-        # self.visualizer.print_current_errors(self.epoch, errors)
-    ##
-    def train(self):
-        """ Train the model
-        """
-
-        ##
-        # TRAIN
-        self.total_steps = 0
-        best_auc = 0
-
-        # Train for niter epochs.
-        print(">> Training model %s." % self.name())
-        for self.epoch in range(self.opt.iter, self.opt.niter):
-            # Train for one epoch
-            self.train_epoch()
-            res = self.test()
-            if res['AUC'] > best_auc:
-                best_auc = res['AUC']
-                self.save_weights(self.epoch)
-            self.visualizer.print_current_performance(res, best_auc)
-        print(">> Training model %s.[Done]" % self.name())
-
-    ##
-    def test(self):
-        """ Test GANomaly model.
-
-        Args:
-            dataloader ([type]): Dataloader for the test set
-
-        Raises:
-            IOError: Model weights not found.
-        """
-        with torch.no_grad():
-            # Load the weights of netg and netd.
-            if self.opt.load_weights:
-                path = "./output/{}/{}/train/weights/netG.pth".format(self.name().lower(), self.opt.dataset)
-                pretrained_dict = torch.load(path)['state_dict']
-
-                try:
-                    self.netg.load_state_dict(pretrained_dict)
-                except IOError:
-                    raise IOError("netG weights not found")
-                print('   Loaded weights.')
-
-            self.opt.phase = 'test'
-
-            # Create big error tensor for the test set.
-            self.an_scores = torch.zeros(size=(len(self.dataloader['test'].dataset),), dtype=torch.float32, device=self.device)
-            self.gt_labels = torch.zeros(size=(len(self.dataloader['test'].dataset),), dtype=torch.long,    device=self.device)
-            self.latent_i  = torch.zeros(size=(len(self.dataloader['test'].dataset), self.opt.nz), dtype=torch.float32, device=self.device)
-            self.latent_o  = torch.zeros(size=(len(self.dataloader['test'].dataset), self.opt.nz), dtype=torch.float32, device=self.device)
-
-            # print("   Testing model %s." % self.name())
-            self.times = []
-            self.total_steps = 0
-            epoch_iter = 0
-            for i, data in enumerate(self.dataloader['test'], 0):
-                self.total_steps += self.opt.batchsize
-                epoch_iter += self.opt.batchsize
-                time_i = time.time()
-                self.set_input(data)
-                self.fake, latent_i, latent_o = self.netg(self.input)
-
-                error = torch.mean(torch.pow((latent_i-latent_o), 2), dim=1)
-                time_o = time.time()
-
-                self.an_scores[i*self.opt.batchsize : i*self.opt.batchsize+error.size(0)] = error.reshape(error.size(0))
-                self.gt_labels[i*self.opt.batchsize : i*self.opt.batchsize+error.size(0)] = self.gt.reshape(error.size(0))
-                self.latent_i [i*self.opt.batchsize : i*self.opt.batchsize+error.size(0), :] = latent_i.reshape(error.size(0), self.opt.nz)
-                self.latent_o [i*self.opt.batchsize : i*self.opt.batchsize+error.size(0), :] = latent_o.reshape(error.size(0), self.opt.nz)
-
-                self.times.append(time_o - time_i)
-
-                # Save test images.
-                if self.opt.save_test_images:
-                    dst = os.path.join(self.opt.outf, self.opt.name, 'test', 'images')
-                    if not os.path.isdir(dst):
-                        os.makedirs(dst)
-                    real, fake, _ = self.get_current_images()
-                    vutils.save_image(real, '%s/real_%03d.eps' % (dst, i+1), normalize=True)
-                    vutils.save_image(fake, '%s/fake_%03d.eps' % (dst, i+1), normalize=True)
-
-            # Measure inference time.
-            self.times = np.array(self.times)
-            self.times = np.mean(self.times[:100] * 1000)
-
-            # Scale error vector between [0, 1]
-            self.an_scores = (self.an_scores - torch.min(self.an_scores)) / (torch.max(self.an_scores) - torch.min(self.an_scores))
-            # auc, eer = roc(self.gt_labels, self.an_scores)
-            auc = evaluate(self.gt_labels, self.an_scores, metric=self.opt.metric)
-            performance = OrderedDict([('Avg Run Time (ms/batch)', self.times), ('AUC', auc)])
-
-            if self.opt.display_id > 0 and self.opt.phase == 'test':
-                counter_ratio = float(epoch_iter) / len(self.dataloader['test'].dataset)
-                self.visualizer.plot_performance(self.epoch, counter_ratio, performance)
-            return performance
